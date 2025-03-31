@@ -6,7 +6,20 @@ import glob
 import HandTrackingModule as htm
 from collections import deque
 
-# === Function to create a transparent mandala (only black lines, transparent rest) ===
+drawing_base = None  # Used to overwrite files in 'continue' mode
+
+# === Extract contours from transparent overlay ===
+def extract_contours_from_overlay(overlay_img):
+    alpha = overlay_img[:, :, 3]
+    gray = cv2.cvtColor(overlay_img[:, :, :3], cv2.COLOR_BGR2GRAY)
+    _, binary_lines = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
+    mask = cv2.bitwise_and(binary_lines, binary_lines, mask=alpha)
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    return [cnt for cnt in contours if 100 < cv2.contourArea(cnt) < 100000]
+
+# === Function to create a transparent mandala ===
 def create_transparent_mandala(input_path, output_path):
     img = cv2.imread(input_path)
     img = cv2.resize(img, (1280, 720))
@@ -17,9 +30,9 @@ def create_transparent_mandala(input_path, output_path):
     rgba = [b, g, r, alpha]
     final = cv2.merge(rgba)
     cv2.imwrite(output_path, final)
-    print(f"✅ Transparent mandala saved as {output_path}")
+    print(f"\u2705 Transparent mandala saved as {output_path}")
 
-# === Auto-convert all mandalas to transparent versions ===
+# === Auto-convert mandalas ===
 def batch_convert_mandalas():
     os.makedirs("Mandalas", exist_ok=True)
     for path in glob.glob("Mandalas/*.jpg") + glob.glob("Mandalas/*.jpeg") + glob.glob("Mandalas/*.png"):
@@ -31,17 +44,14 @@ def batch_convert_mandalas():
 
 batch_convert_mandalas()
 
-#### Settings ####
+# === Settings ===
 brushThick = 15
 eraserThick = 100
 saveFramesRequired = 20
 MAX_UNDO = 5
 
 folderPath = "Header"
-myList = os.listdir(folderPath)
-overLayList = [cv2.imread(f'{folderPath}/{imagePath}') for imagePath in myList]
-print(len(overLayList))
-
+overLayList = [cv2.imread(f'{folderPath}/{img}') for img in os.listdir(folderPath)]
 header = overLayList[0]
 drawColor = (255, 105, 180)
 
@@ -51,8 +61,9 @@ cap.set(4, 720)
 
 detector = htm.handDetecor(detCon=0.85)
 
+# === Mode Selection ===
 def choose_mode():
-    print("\n🎨 Choose Drawing Mode:")
+    print("\n\U0001f3a8 Choose Drawing Mode:")
     print("1. Start new blank drawing")
     print("2. Color a mandala")
     print("3. Continue a saved drawing")
@@ -64,27 +75,32 @@ def choose_mode():
         mandalas = glob.glob("Mandalas/*_transparent.png")
         print("\nAvailable mandalas:")
         for i, m in enumerate(mandalas):
-            print(f"{i+1}. {os.path.basename(m)}")
+            print(f"{i + 1}. {os.path.basename(m)}")
         index = int(input("Choose a mandala: ")) - 1
         return 'mandala', mandalas[index] if 0 <= index < len(mandalas) else None
     elif choice == '3':
-        drawings = glob.glob("SavedDrawings/*.png")
+        previews = glob.glob("SavedDrawings/*_preview.png")
         print("\nAvailable saved drawings:")
-        for i, d in enumerate(drawings):
-            print(f"{i+1}. {os.path.basename(d)}")
+        for i, p in enumerate(previews):
+            print(f"{i + 1}. {os.path.basename(p)}")
         index = int(input("Choose a drawing: ")) - 1
-        if 0 <= index < len(drawings):
-            img_path = drawings[index]
-            overlay_path = img_path.replace(".png", "_overlay.png")
-            return 'continue', (img_path, overlay_path if os.path.exists(overlay_path) else None)
+
+        if 0 <= index < len(previews):
+            preview_path = previews[index]
+            base = preview_path.replace("_preview.png", "")
+            paint_path = base + "_paint.png"
+            overlay_path = base + "_overlay.png"
+            global drawing_base
+            drawing_base = base  # save for later overwrite
+            return 'continue', (paint_path, overlay_path)
         else:
             return 'new', None
     else:
         print("Invalid choice. Starting with blank drawing.")
         return 'new', None
 
+# === Initialize State ===
 mode, selected_image_path = choose_mode()
-
 undo_stack = deque(maxlen=MAX_UNDO)
 redo_stack = deque(maxlen=MAX_UNDO)
 fillMode = False
@@ -92,56 +108,65 @@ mandala_img_overlay = None
 mandala_contours = []
 imgCanvas = np.zeros((720, 1280, 3), np.uint8)
 
+# === Load modes ===
 if mode == 'mandala' and selected_image_path:
     mandala_img_overlay = cv2.imread(selected_image_path, cv2.IMREAD_UNCHANGED)
     mandala_img_overlay = cv2.resize(mandala_img_overlay, (1280, 720))
-
-    # Prepare contours from the black lines
-    gray = cv2.cvtColor(mandala_img_overlay[:, :, :3], cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
-    kernel = np.ones((3, 3), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-    contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    mandala_contours = [cnt for cnt in contours if 100 < cv2.contourArea(cnt) < 100000]
+    mandala_contours = extract_contours_from_overlay(mandala_img_overlay)
 
 elif mode == 'continue' and selected_image_path:
-    drawing_path, overlay_path = selected_image_path
-    loaded_img = cv2.imread(drawing_path)
-    loaded_img = cv2.resize(loaded_img, (1280, 720))
-    imgCanvas = loaded_img.copy()
-    if overlay_path:
+    paint_path, overlay_path = selected_image_path
+    painted = cv2.imread(paint_path, cv2.IMREAD_UNCHANGED)
+    if painted is None:
+        print("\u274c Failed to load saved paint image!")
+        exit()
+
+    painted = cv2.resize(painted, (1280, 720))
+    b, g, r, a = cv2.split(painted)
+    imgCanvas = cv2.merge((b, g, r))
+    imgCanvas[a == 0] = 0
+
+    if os.path.exists(overlay_path):
         mandala_img_overlay = cv2.imread(overlay_path, cv2.IMREAD_UNCHANGED)
         mandala_img_overlay = cv2.resize(mandala_img_overlay, (1280, 720))
-        gray = cv2.cvtColor(mandala_img_overlay[:, :, :3], cv2.COLOR_BGR2GRAY)
-        _, binary = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
-        kernel = np.ones((3, 3), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-        contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        mandala_contours = [cnt for cnt in contours if 100 < cv2.contourArea(cnt) < 100000]
+        mandala_contours = extract_contours_from_overlay(mandala_img_overlay)
 
-xp, yp = None, None
-saveGestureCount = 0
-
+# === Save Drawing ===
 def save_drawing():
-    whiteBackground = np.ones((720, 1280, 3), np.uint8) * 255
-    imgGray = cv2.cvtColor(imgCanvas, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(imgGray, 10, 255, cv2.THRESH_BINARY)
-    maskInv = cv2.bitwise_not(mask)
-    drawingOnly = cv2.bitwise_and(imgCanvas, imgCanvas, mask=mask)
-    whiteOnly = cv2.bitwise_and(whiteBackground, whiteBackground, mask=maskInv)
-    finalDrawing = cv2.add(whiteOnly, drawingOnly)
-
-    if mandala_img_overlay is not None and mandala_img_overlay.shape[2] == 4:
-        overlay_rgb = mandala_img_overlay[:, :, :3]
-        alpha_mask = mandala_img_overlay[:, :, 3] / 255.0
-        overlay_rgb = overlay_rgb.astype(np.float32)
-        for c in range(3):
-            finalDrawing[:, :, c] = finalDrawing[:, :, c] * (1 - alpha_mask) + overlay_rgb[:, :, c] * alpha_mask
-
     os.makedirs("SavedDrawings", exist_ok=True)
-    filename = f"SavedDrawings/Drawing_{int(time.time())}.png"
-    cv2.imwrite(filename, finalDrawing)
-    print(f"✅ Desen salvat ca {filename}!")
+    global drawing_base
+
+    if mode == 'continue' and drawing_base:
+        filename_base = drawing_base
+    else:
+        filename_base = f"SavedDrawings/Drawing_{int(time.time())}"
+
+    # 1. Save paint layer (user drawing with alpha)
+    imgGray = cv2.cvtColor(imgCanvas, cv2.COLOR_BGR2GRAY)
+    _, alpha = cv2.threshold(imgGray, 10, 255, cv2.THRESH_BINARY)
+    b, g, r = cv2.split(imgCanvas)
+    drawing_rgba = cv2.merge((b, g, r, alpha))
+    cv2.imwrite(f"{filename_base}_paint.png", drawing_rgba)
+
+    # 2. Save overlay layer (if any)
+    if mandala_img_overlay is not None:
+        cv2.imwrite(f"{filename_base}_overlay.png", mandala_img_overlay)
+
+    # 3. Create white preview image
+    white = np.ones((720, 1280, 3), dtype=np.uint8) * 255
+    mask = alpha
+    color_part = cv2.bitwise_and(imgCanvas, imgCanvas, mask=mask)
+    bg_part = cv2.bitwise_and(white, white, mask=cv2.bitwise_not(mask))
+    preview = cv2.add(bg_part, color_part)
+
+    if mandala_img_overlay is not None:
+        overlay_rgb = mandala_img_overlay[:, :, :3].astype(np.float32)
+        alpha_overlay = mandala_img_overlay[:, :, 3] / 255.0
+        for c in range(3):
+            preview[:, :, c] = preview[:, :, c] * (1 - alpha_overlay) + overlay_rgb[:, :, c] * alpha_overlay
+
+    cv2.imwrite(f"{filename_base}_preview.png", preview)
+    print(f"\u2705 Drawing saved as {filename_base}_preview.png (and paint + overlay)")
 
 while True:
     success, img = cap.read()
@@ -228,7 +253,7 @@ while True:
     img = cv2.bitwise_and(img, imgInv)
     img = cv2.bitwise_or(img, imgCanvas)
 
-    if mandala_img_overlay is not None and mandala_img_overlay.shape[2] == 4:
+    if mandala_img_overlay is not None:
         overlay_rgb = mandala_img_overlay[:, :, :3].astype(np.float32)
         alpha_mask = mandala_img_overlay[:, :, 3] / 255.0
         for c in range(3):
